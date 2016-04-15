@@ -1,0 +1,275 @@
+---
+title: 'Assignment 1: Predictive Analytics'
+author: "Sameh Metias"
+date: "April 13, 2016"
+output: html_document
+---
+Loading the required libraries
+```{r}
+library("TunePareto")
+library("plyr")
+library("dplyr")
+library("ggplot2")
+library("reshape2")
+library("RWeka")
+library("partykit")
+library(knitr)
+library("adabag")
+```
+
+#Problem 1
+In this problem only the loading of the data into R is required and is achieved with the following code
+```{r}
+data.all <- read.csv(file="sonar.all-data.csv",head=FALSE,sep=",")
+glimpse(data.all)
+```
+
+From the summary it is obvious that the data does not contain any NA values. Howver checking for outliers has to be done
+
+```{r}
+meltData <- melt(data.all%>%filter(V61=="M"))
+p <- ggplot(meltData, aes(factor(variable), value)) 
+p + geom_boxplot() +labs(title="Checking outliers for M-class")
+
+meltData <- melt(data.all%>%filter(V61=="R"))
+p <- ggplot(meltData, aes(factor(variable), value)) 
+p + geom_boxplot() +labs(title="Checking outliers for R-class")
+
+```
+
+From the plots it is obvious that the data contains many outliers. Hence, a clean version of the data is required in order to achieve better results. However, let's examine the results on this current data and experiment with it.
+
+#Problem 2
+The first part of this problem requires building a C4.5 decision tree on the sonar data. The J48 trees implemented in the RWeka package generate unpruned or pruned C4.5 decision trees. The following code experiments the different parameters for constructing the C4.5 tree while testing it on the same data set as training and showing the equivalent result
+```{r}
+tryTree <- function (x){
+plot(x)
+total.summary<-summary(x)
+cm<-total.summary$confusionMatrix
+acc <- total.summary$details[1]
+abs.err <- total.summary$details[5]
+root.err <- total.summary$details[6]
+#accuracy
+cat("The accuracy is:",acc,";")
+#mean absolute error
+cat("The mean absolute error is:",abs.err,";")
+#root mean squared error
+cat("The root mean squared error is:",root.err,";")
+# Precision: tp/(tp+fp):
+pr<-cm[1,1]/sum(cm[1:2,1])
+cat("The precision is:",pr,";")
+# Recall: tp/(tp + fn):
+rc<-cm[1,1]/sum(cm[1,1:2])
+cat("The recall is:",rc,";")
+# F-Score: 2 * precision * recall /(precision + recall):
+fm <- 2 * pr * rc / (pr + rc)
+cat("The fMeasure is:",fm)
+c(acc,abs.err,root.err,pr,rc,fm)
+}
+
+sonar_j48 <- J48(V61 ~ ., data = data.all)
+original<-tryTree(sonar_j48)
+```
+
+The number of parameters that can be adjusted for the C4.5 tree is given by:
+```{r}
+WOW(J48)
+```
+
+Changing the minimum number of instances per leaf setting it to 10 as follows:
+
+```{r}
+sonar_j48 <- J48(V61 ~ ., data = data.all,control = Weka_control(M=10))
+min.leaf.10<-tryTree(sonar_j48)
+```
+
+Notice the dramatic reduction in size of the tree which is also reflected in the reduced performance (accuracy, precision, recall and fMeasure) and increased error values. This can be explained through the restricting each leaf to have a minimum number of 10 instances which leads to false combinations of instance of different classes.
+
+Examining the reduced error pruning of the original tree with the following code:
+
+```{r}
+sonar_j48 <- J48(V61 ~ ., data = data.all,control = Weka_control(R = TRUE))
+red.Err<-tryTree(sonar_j48)
+```
+
+The tree got even smaller that with restricted number of instances per leaf. The explaination of this is that the algorithm removes the subtree at that node, make it a leaf and assign the most common class at that node. Nodes are removed iteratively choosing the node whose removal increases the decision tree accuracy most.
+
+To compare the results of the three variants of the C4.5 tree consider the following table
+
+```{r}
+h <- c("Accuracy (%)","Mean absolute error" ,"Root mean squared error ", 
+       "Precision" ,"Recall","fMeasure")
+tbl<-data.frame(rbind(original,min.leaf.10,red.Err))
+names(tbl)<-h
+row.names(tbl)<-c("original","min.leaf.10","red.Err")
+tbl%>%kable()
+```
+
+Testing a classifier on the same data set as the training data set does not reveal accurate results on the performance of the classifier because it is not tested against un seen data. That is why k-fold cross-validation is introduced at this stage. The data is partioned in k sets, trained on k-1 sets and tested for the remaining k set. The process is repeated k times and the results are averaged.
+
+The following code does a 10-fold cross-validation assessment on the original c4.5 tree. The data is partitioned into random data sets:
+
+```{r}
+sonar_j48 <- J48(V61 ~ ., data = data.all)
+total.summary <- evaluate_Weka_classifier(sonar_j48, numFolds = 10,
+                complexity = TRUE, seed = 123, class = TRUE)
+total.summary
+cm<-total.summary$confusionMatrix
+cm
+acc <- total.summary$details[1]
+abs.err <- total.summary$details[5]
+root.err <- total.summary$details[6]
+#accuracy
+cat("The accuracy is:",acc,";")
+#mean absolute error
+cat("The mean absolute error is:",abs.err,";")
+#root mean squared error
+cat("The root mean squared error is:",root.err,";")
+# Precision: tp/(tp+fp):
+pr<-cm[1,1]/sum(cm[1:2,1])
+cat("The precision is:",pr,";")
+# Recall: tp/(tp + fn):
+rc<-cm[1,1]/sum(cm[1,1:2])
+cat("The recall is:",rc,";")
+# F-Score: 2 * precision * recall /(precision + recall):
+fm <- 2 * pr * rc / (pr + rc)
+cat("The fMeasure is:",fm)
+original.10.fold.rand<-c(acc,abs.err,root.err,pr,rc,fm)
+tbl<-data.frame(rbind(original,min.leaf.10,red.Err,original.10.fold.rand))
+names(tbl)<-h
+row.names(tbl)<-c("original","min.leaf.10","red.Err","original.10.fold.rand")
+tbl%>%kable()
+```
+
+However, randomly partitioned folds are not necessarily representative of the whole data set. This is why the folds have to be stratified:
+
+```{r}
+foldList <- generateCVRuns(labels =data.all[,"V61"],ntimes=1,nfold = 10,stratified=TRUE)
+
+res.class <-lapply(foldList$`Run  1`, function(x) 
+  {temp0 <- evaluate_Weka_classifier(J48(V61 ~ ., data = data.all[-x,]),    
+   newdata=data.all[x,],class=TRUE)
+   temp2<-(temp0$detailsClass)
+   cbind(data.frame(temp2),t=rownames(temp2))
+   })
+library(plyr)
+temp3<- ldply(res.class, data.frame)
+detach(package:plyr)
+details.2<-temp3%>%select(precision,recall,fMeasure,t)%>%group_by(t)%>%
+  summarise(avg.precision=mean(precision),avg.recall=mean(recall),
+  avg.fMeasure=mean(fMeasure))%>%
+  filter(t=="M") %>%select(avg.precision,avg.recall,avg.fMeasure)
+
+res.class <-lapply(foldList$`Run  1`, function(x) 
+{temp0 <- evaluate_Weka_classifier(J48(V61 ~ ., data = data.all[-x,]),
+                                                    newdata=data.all[x,],class=TRUE)
+                                                    temp1<-data.frame(t(temp0$details))
+                                                    })
+library(plyr)
+temp3<- ldply(res.class, data.frame)
+detach(package:plyr)
+details.1<-(sapply(temp3%>%select(-.id),function(x) mean(x)))
+
+original.10.fold.stratified<-data.frame(c(details.1[1],
+                                          details.1[5],details.1[6],details.2))
+tbl<-data.frame(rbind(original,min.leaf.10,red.Err,
+                      original.10.fold.rand,original.10.fold.stratified))
+names(tbl)<-h
+row.names(tbl)<-c("original","min.leaf.10","red.Err",
+                  "original.10.fold.rand","original.10.fold.stratified")
+tbl%>%kable( caption = "Performance Comparison")
+
+```
+
+Before moving on to the next questions, consider the following two notes:
+- For the following questions, only the last performance evaluation (10-fold cross-validation with stratified folds) is going to be considered
+
+- Precision, recall and fMeasure are class dependent values, i.e. they are calculated for each class. However, for the sake of comparison only the evaluation metrics for class "M" are considered because both classes are considered equally important and hence either of them can be chosen.
+
+#Problem 3
+
+In this problem, multiple classifiers are compared agains each other. Starting with the Random Forest classifier test using a 10-fold cross validation. Till now the second approach has been followed in testing the models: the model is built for k-1 folds and tested against the kth fold and the results are aggregated. However, in order to speed up computations, the data is going to be divided into 80% for training, tuning and cross validating and the remaining 20% are used for testing and assesment.
+```{r}
+library(caret)
+model<-function(x){
+  ind<-createDataPartition(data.all$V61,p=0.8)
+  rf_model<-train(V61~.,data.all[ind$Resample1,],method=x,
+                trControl=trainControl(method="cv",number=10))
+  testPred.rf <- predict(rf_model, data.all[-ind$Resample1,])
+testPred.rf
+eval.rf<-confusionMatrix(testPred.rf, data.all[-ind$Resample1,]$V61)
+acc.rf<-eval.rf$overall[1]*100
+pr.rf<-eval.rf$byClass[2]
+rc.rf<-eval.rf$byClass[1]
+fm.rf <- 2 * pr.rf * rc.rf / (pr.rf + rc.rf)
+original.rf<-c(acc.rf,pr.rf,rc.rf,fm.rf)  
+original.rf<-data.frame(t(original.rf))
+row.names(original.rf)<-c(x)
+names(original.rf)<-c("Accuracy (%)", "Precision", "Recall", "fMeasure" )
+original.rf
+}
+
+cmp<-rbind(model("rf"),model("svmLinear"),model("nb"),model("nnet"))
+```
+```{r,results="hide"}
+cmp<-rbind(cmp,tbl[5,c(1,4,5,6)])
+cmp%>%kable( caption = "Performance Comparison of different classifiers")
+```
+
+From the results it is clear that no classifier significantly outperforms the others.
+Comming to the ensemble classifiers, the following code experiments two ensemble classifiers which are bagging with the C4.5 decision as a base classifier and bagging both running with 10-fold cross validation. The bagging and boosting models that are implemented in the adaboost package and that run with cross validation do not accept a test set, however they apply the second approach we discussed where the whole data set acts as a test and training set and the CV algorithm takes care of training and testing on unseen data set and aggregating the results.  
+```{r}
+baggingC4.5 <-function(x){
+  ind<-createDataPartition(data.all$V61,p=0.8)
+  bagging_model <- bagging.cv(V61~.,data.all,v=10,mfinal=x, 
+    control=rpart.control(maxdepth=10, minsplit=15))
+  testPred.bag <- bagging_model
+cnf<-testPred.bag$confusion
+cnf
+baggingC4.5.acc <- (cnf[1,1]+cnf[2,2])/sum(cnf) *100
+baggingC4.5.pr<-cnf[1,1]/sum(cnf[1,1:2])
+baggingC4.5.rc<-cnf[1,1]/sum(cnf[1:2,1])
+baggingC4.5.fm <- 2 * baggingC4.5.pr * baggingC4.5.rc / (baggingC4.5.pr + baggingC4.5.rc)
+
+baggingC4.5.eval<-c(baggingC4.5.acc,baggingC4.5.pr,baggingC4.5.rc,baggingC4.5.fm)  
+baggingC4.5.eval<-data.frame(t(baggingC4.5.eval))
+row.names(baggingC4.5.eval)<-c(paste("bagging",x,sep="-"))
+names(baggingC4.5.eval)<-c("Accuracy (%)", "Precision", "Recall", "fMeasure" )
+baggingC4.5.eval
+}
+
+cmp.bag<-rbind(baggingC4.5(5),baggingC4.5(10),baggingC4.5(100),baggingC4.5(300))
+cmp.bag<-rbind(cmp.bag,tbl[5,c(1,4,5,6)])
+cmp.bag%>%kable( caption = "Performance Comparison of bagging for different number of trees")
+```
+
+It is interesting to notice that the performance of independent on the number of trees we are including for the bagging.
+
+
+```{r,results="hide"}
+boost <-function(x,y){
+  boosting_model <- boosting.cv(V61~.,data.all,v=10,mfinal=x, 
+    control=rpart.control(maxdepth=10, minsplit=15),coeflearn = y)
+  testPred.boost <- boosting_model
+cnf.boost<-testPred.boost$confusion
+cnf.boost
+boost.acc <- (cnf.boost[1,1]+cnf.boost[2,2])/sum(cnf.boost) *100
+boost.pr<-cnf.boost[1,1]/sum(cnf.boost[1,1:2])
+boost.rc<-cnf.boost[1,1]/sum(cnf.boost[1:2,1])
+boost.fm <- 2 * boost.pr * boost.rc / (boost.pr + boost.rc)
+
+boost.eval<-c(boost.acc,boost.pr,boost.rc,boost.fm)  
+boost.eval<-data.frame(t(boost.eval))
+row.names(boost.eval)<-c(paste("boost",x,y,sep="-"))
+names(boost.eval)<-c("Accuracy (%)", "Precision", "Recall", "fMeasure" )
+boost.eval
+}
+
+cmp.boost<-rbind(boost(5,"Breiman"),boost(5,"Freund"),boost(10,"Breiman"),boost(10,"Freund"),boost(10,"Zhu"))
+```
+```{r}
+cmp.boost<-rbind(cmp.boost,tbl[5,c(1,4,5,6)])
+cmp.boost%>%kable( caption = "Performance Comparison of adaboosting for different number of iterations and different coefficient of learning")
+```
+
+As for the boosting, the coefficient of learning as well as number of iterations were tested. Each time the code was run, it yielded different result leaving no room for direct relations between the learning coefficient and the number of iterations.
